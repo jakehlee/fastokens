@@ -125,6 +125,12 @@ pub struct Tokenizer {
     /// When the pre-tokenizer is `Sequence([Split, ByteLevel(bulk)])`,
     /// we store a Split-only pre-tokenizer and fuse ByteLevel into BPE.
     split_only: Option<PreTokenizer>,
+    /// Whether to run vocab-aware (unbridgeable-bigram) splitting on encode.
+    /// True for metaspace models (e.g. Gemma) whose pre-tokenizer is a no-op
+    /// after normalization; false for ByteLevel models, whose regex `Split`
+    /// already produces word-level chunks. The pass is output-preserving, so
+    /// this flag only affects performance, never correctness.
+    needs_vocab_splitting: bool,
 }
 
 impl Tokenizer {
@@ -146,6 +152,11 @@ impl Tokenizer {
         // Detect Sequence([Split, ByteLevel(bulk)]) for fused byte-level+BPE.
         let split_only = Self::detect_fused_byte_level(&pre_tokenizer);
 
+        // ByteLevel pipelines already chunk at word boundaries via their regex
+        // Split, so vocab-aware splitting adds cost without benefit. Only run it
+        // when no ByteLevel step is present (metaspace models like Gemma).
+        let needs_vocab_splitting = !Self::pre_tokenizer_contains_byte_level(&pre_tokenizer);
+
         Ok(Self {
             added_tokens,
             normalizer,
@@ -154,7 +165,21 @@ impl Tokenizer {
             post_processor,
             decoder,
             split_only,
+            needs_vocab_splitting,
         })
+    }
+
+    /// Recursively check whether a pre-tokenizer pipeline contains a `ByteLevel`
+    /// step (including inside a `Sequence`).
+    fn pre_tokenizer_contains_byte_level(pt: &Option<PreTokenizer>) -> bool {
+        fn contains(pt: &PreTokenizer) -> bool {
+            match pt {
+                PreTokenizer::ByteLevel(_) => true,
+                PreTokenizer::Split(_) => false,
+                PreTokenizer::Sequence(steps) => steps.iter().any(contains),
+            }
+        }
+        pt.as_ref().is_some_and(contains)
     }
 
     /// If `pt` is `Sequence([Split, ByteLevel(bulk)])`, return a Split-only
@@ -286,6 +311,17 @@ impl Tokenizer {
         // 2. Pre-tokenize (refine splits in place).
         if let Some(ref pt) = self.pre_tokenizer {
             pt.pre_tokenize(&mut pts)?;
+        }
+
+        // 2b. Break each text split at unbridgeable byte-pair boundaries.
+        //     Split at positions where adjacent bytes never appear together in
+        //     any vocab token. This is provably output-preserving and provides
+        //     fine-grained word-level chunking for models that don't use
+        //     ByteLevel (whose regex Split already chunks at word boundaries).
+        if self.needs_vocab_splitting {
+            if let Some(table) = self.model.bigram_bridge_table() {
+                split_on_unbridgeable_bigrams(&mut pts, table);
+            }
         }
 
         // 3. Tokenize each text split with the model.
@@ -488,6 +524,60 @@ impl Tokenizer {
 
         PreTokenizedString::new(buffer, splits)
     }
+}
+
+
+/// Split each text chunk at unbridgeable byte-pair boundaries using the
+/// vocab-derived bigram bridge table.
+///
+/// A byte pair (prev, cur) is "unbridgeable" if no vocabulary token contains
+/// that adjacent byte sequence. Splitting at such boundaries is provably
+/// output-preserving: any BPE merge that spans the boundary would produce a
+/// token containing that byte pair, which cannot exist in the vocabulary.
+///
+/// This generalizes newline splitting and enables fine-grained word-level
+/// chunking even in metaspace tokenizers like Gemma, where the pre-tokenizer
+/// is effectively a no-op after normalization.
+fn split_on_unbridgeable_bigrams(
+    pts: &mut PreTokenizedString,
+    bigram_table: &models::bpe::BigramBridgeTable,
+) {
+    let bytes = pts.buffer().as_bytes();
+    let mut new_splits = Vec::with_capacity(pts.splits().len() * 2);
+
+    for split in pts.splits() {
+        if split.token_id.is_some() || split.range.is_empty() {
+            new_splits.push(split.clone());
+            continue;
+        }
+
+        let end = split.range.end;
+        let mut start = split.range.start;
+
+        for i in (start + 1)..end {
+            let prev = bytes[i - 1];
+            let cur = bytes[i];
+
+            // Split here if:
+            // 1. This byte pair never appears in vocab, AND
+            // 2. Position i is a UTF-8 char boundary (cur is not a continuation byte)
+            if !bigram_table.is_bridgeable(prev, cur) && (cur & 0xC0) != 0x80 {
+                new_splits.push(PtSplit {
+                    range: start..i,
+                    token_id: None,
+                });
+                start = i;
+            }
+        }
+
+        // Push the final segment
+        new_splits.push(PtSplit {
+            range: start..end,
+            token_id: None,
+        });
+    }
+
+    pts.refine_splits(new_splits);
 }
 
 // ---------------------------------------------------------------------------
